@@ -1,0 +1,7 @@
+placa,confianza,valida_formato,n_lecturas,t_primer_visto_s,t_ultimo_visto_s,track_id,timestamp,recorte
+PBA1234,0.968,True,45,1.16,7.0,8,2026-09-19T10:07:34,recortes/PBA1234_8.png
+GSC7789,0.933,True,46,9.16,15.0,17,2026-09-19T10:07:46,recortes/GSC7789_17.png
+ABG4521,0.938,True,46,17.2,23.0,24,2026-09-19T10:07:59,recortes/ABG4521_24.png
+PBA1234,0.971,True,45,1.16,7.0,14,2026-09-19T10:22:03,recortes/PBA1234_14.png
+GSC7789,0.663,True,3,14.32,16.2,31,2026-09-19T10:22:12,recortes/GSC7789_31.png
+ABG4521,0.859,True,45,17.2,23.0,42,2026-09-19T10:22:18,recortes/ABG4521_42.png

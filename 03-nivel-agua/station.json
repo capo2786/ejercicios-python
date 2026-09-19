@@ -1,0 +1,6 @@
+{
+  "roi": [[20, 120], [620, 120], [620, 350], [20, 350]],
+  "ref_points": [[320, 340, 0.0], [320, 140, 4.0]],
+  "thresholds": {"vigilancia": 1.8, "alerta": 2.6, "critico": 3.2},
+  "trend_window_s": 8.0
+}
