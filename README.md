@@ -49,6 +49,16 @@ La primera vez que corras el contador de personas, YOLO descarga su modelo
 cd 01-contador-personas
 python contador.py vtest.avi --motor yolo --speed 1
 ```
+```bash
+cd 02-lector-placas
+python anpr.py autos.mp4 --formato ecuador --speed 1
+```
+
+```bash
+cd 03-nivel-agua
+python flood_monitor.py rio_test.mp4 --station 02 --speed 1
+```
+
 
 Todos los scripts comparten las mismas opciones:
 
