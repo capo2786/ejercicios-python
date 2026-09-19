@@ -32,23 +32,26 @@ Uso:
 Teclas: q salir | espacio pausa | s captura PNG | r reinicia contadores
 """
 
+# Permite escribir anotaciones de tipo modernas (list[Persona]) en Python 3.8+
 from __future__ import annotations
 
-import argparse
-import csv
-import json
-import os
-import sys
-import time
-from collections import deque
-from datetime import datetime, timedelta
+import argparse                      # lee las opciones de la linea de comandos (--motor, --speed...)
+import csv                           # escribe los archivos de resultados .csv
+import json                          # lee/guarda la linea de conteo en linea.json
+import os                            # revisa si existen archivos
+import sys                           # sys.exit() para terminar con un mensaje de error
+import time                          # reloj real, para reproducir a velocidad real
+from collections import deque        # lista con tamano maximo: al llenarse descarta lo mas viejo
+from datetime import datetime, timedelta   # fechas y formato h:mm:ss
 
-import cv2
-import numpy as np
+import cv2                           # OpenCV: leer video, dibujar, mostrar ventanas
+import numpy as np                   # NumPy: operaciones con vectores y matrices (las imagenes son matrices)
 
 # --------------------------------------------------------------------------- #
 # Paleta (BGR)
 # --------------------------------------------------------------------------- #
+# OJO: OpenCV usa el orden Azul-Verde-Rojo (BGR), no RGB.
+# Por eso RED es (60, 60, 255): el 255 esta en la ultima posicion.
 CYAN = (230, 220, 60)
 GREEN = (120, 220, 0)
 AMBER = (0, 190, 255)
@@ -56,6 +59,7 @@ RED = (60, 60, 255)
 WHITE = (245, 245, 245)
 GREY = (150, 150, 150)
 DARK = (35, 28, 20)
+# Colores que se reparten entre las personas para distinguirlas en pantalla
 COLORES = [(230, 220, 60), (120, 220, 0), (0, 190, 255), (200, 120, 255),
            (255, 180, 90), (120, 255, 220), (180, 180, 255), (90, 230, 160)]
 
@@ -65,27 +69,43 @@ COLORES = [(230, 220, 60), (120, 220, 0), (0, 190, 255), (200, 120, 255),
 # --------------------------------------------------------------------------- #
 class Detector:
     """Devuelve una lista de cajas (x, y, w, h) de personas."""
+    # Una "caja" es un rectangulo: (x, y) es la esquina superior izquierda,
+    # w es el ancho y h el alto, todo en pixeles.
 
     def __init__(self, motor="auto", modelo=None, proto=None, conf_min=0.45):
+        # conf_min: el detector da una "confianza" de 0 a 1 por cada caja.
+        # Descartamos las que esten por debajo (0.45 = 45 %).
         self.conf_min = conf_min
-        self.motor = None
+        self.motor = None               # aun no sabemos que motor vamos a usar
 
+        # --- Intento 1: YOLO (red neuronal moderna, la mas precisa) ---
         if motor in ("auto", "yolo"):
             try:
+                # Se importa aqui adentro para que el programa funcione
+                # aunque ultralytics no este instalado (se usa otro motor).
                 from ultralytics import YOLO                      # noqa: PLC0415
+                # yolov8n.pt = version "nano" de YOLOv8: la mas pequena y rapida.
+                # Si no existe el archivo, ultralytics lo descarga solo (6 MB).
                 self.yolo = YOLO(modelo or "yolov8n.pt")
                 self.motor = "yolo"
             except Exception as exc:                              # noqa: BLE001
+                # Si el usuario PIDIO yolo explicitamente y fallo, paramos.
+                # Si era "auto", seguimos probando el siguiente motor.
                 if motor == "yolo":
                     sys.exit(f"YOLO no disponible ({exc}).  pip install ultralytics")
 
+        # --- Intento 2: MobileNet-SSD (red neuronal mas antigua, via OpenCV) ---
         if self.motor is None and motor in ("auto", "dnn"):
+            # Necesita dos archivos: el .caffemodel (pesos) y el .prototxt (arquitectura)
             if modelo and proto and os.path.exists(modelo) and os.path.exists(proto):
                 self.net = cv2.dnn.readNetFromCaffe(proto, modelo)
                 self.motor = "dnn"
             elif motor == "dnn":
                 sys.exit("Para --motor dnn pasa --modelo y --proto de MobileNet-SSD.")
 
+        # --- Intento 3 (respaldo): HOG + SVM, viene dentro de OpenCV ---
+        # HOG = Histograma de Gradientes Orientados: describe la silueta por
+        # la direccion de los bordes. Un SVM ya entrenado decide si es persona.
         if self.motor is None:
             self.hog = cv2.HOGDescriptor()
             self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
@@ -97,6 +117,8 @@ class Detector:
                   "muy junta.\n            Para produccion instala:  pip install ultralytics)")
 
     def detectar(self, frame):
+        # Punto de entrada unico: el resto del programa llama detectar()
+        # sin importar que motor hay por dentro.
         if self.motor == "yolo":
             return self._yolo(frame)
         if self.motor == "dnn":
@@ -104,37 +126,51 @@ class Detector:
         return self._hog(frame)
 
     def _yolo(self, frame):
+        # classes=[0]: YOLO conoce 80 clases (auto, perro, silla...).
+        # La clase 0 es "person", asi que solo pedimos personas.
         res = self.yolo(frame, classes=[0], conf=self.conf_min, verbose=False)
         cajas = []
         for r in res:
+            # xyxy = cada caja como (x1, y1, x2, y2): esquina sup. izq. e inf. der.
+            # .cpu().numpy() la pasa de tensor de PyTorch a arreglo de NumPy.
             for b in r.boxes.xyxy.cpu().numpy():
                 x1, y1, x2, y2 = map(int, b[:4])
+                # Convertimos al formato (x, y, ancho, alto) que usa el resto del codigo
                 cajas.append((x1, y1, x2 - x1, y2 - y1))
         return cajas
 
     def _dnn(self, frame):
-        H, W = frame.shape[:2]
+        H, W = frame.shape[:2]          # alto y ancho de la imagen original
+        # La red espera una imagen de 300x300 normalizada:
+        # 0.007843 = 1/127.5 y 127.5 es el valor que se resta (pixeles de -1 a 1).
         blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843,
                                      (300, 300), 127.5)
         self.net.setInput(blob)
-        det = self.net.forward()
+        det = self.net.forward()        # corre la red; devuelve todas las detecciones
         cajas = []
         for i in range(det.shape[2]):
-            conf = float(det[0, 0, i, 2])
+            conf = float(det[0, 0, i, 2])            # confianza de la deteccion i
             if conf < self.conf_min or int(det[0, 0, i, 1]) != 15:   # 15 = person
                 continue
+            # Las coordenadas vienen de 0 a 1; se multiplican por el tamano real
             x1, y1, x2, y2 = (det[0, 0, i, 3:7] * np.array([W, H, W, H])).astype(int)
             cajas.append((x1, y1, x2 - x1, y2 - y1))
         return cajas
 
     def _hog(self, frame):
+        # HOG es lento en imagenes grandes: reducimos a 640 px de ancho como maximo
         escala = 640 / max(frame.shape[1], 1)
         chico = cv2.resize(frame, None, fx=escala, fy=escala) if escala < 1 else frame
+        # winStride: cuanto se desplaza la ventana de busqueda (mayor = mas rapido, menos preciso)
+        # scale=1.05: busca personas de distintos tamanos agrandando 5 % cada vez
         rects, pesos = self.hog.detectMultiScale(chico, winStride=(8, 8),
                                                  padding=(8, 8), scale=1.05)
+        # Devolvemos las cajas al tamano de la imagen original
         inv = 1 / escala if escala < 1 else 1.0
+        # "pesos" es la confianza del SVM: descartamos las debiles (< 0.3)
         cajas = [tuple((np.array(r) * inv).astype(int))
                  for r, p in zip(rects, pesos) if p >= 0.3]
+        # HOG suele dar varias cajas encimadas sobre la misma persona: las limpiamos
         return nms(cajas, 0.4)
 
 
@@ -142,47 +178,57 @@ def nms(cajas, thr=0.4):
     """Supresion de no-maximos por area (evita contar 3 veces a la misma persona)."""
     if not cajas:
         return []
+    # Ordenamos de la caja mas grande a la mas pequena
     cajas = sorted(cajas, key=lambda b: b[2] * b[3], reverse=True)
     keep = []
     for b in cajas:
+        # Nos quedamos con la caja solo si no se solapa mucho con ninguna ya elegida
         if all(iou(b, k) < thr for k in keep):
             keep.append(b)
     return keep
 
 
 def iou(a, b):
+    # IoU = Interseccion sobre Union: cuanto se solapan dos cajas.
+    # 0 = no se tocan, 1 = son identicas.
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
+    # Rectangulo de la interseccion (la zona que comparten)
     x1, y1 = max(ax, bx), max(ay, by)
     x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    union = aw * ah + bw * bh - inter
+    inter = max(0, x2 - x1) * max(0, y2 - y1)      # 0 si no se solapan
+    union = aw * ah + bw * bh - inter             # area total cubierta por ambas
     return inter / union if union else 0.0
 
 
 # --------------------------------------------------------------------------- #
 # 2. Rastreo por centroide
 # --------------------------------------------------------------------------- #
+# El detector solo dice "hay personas aqui" en CADA cuadro, sin saber quien es
+# quien. El rastreador une las detecciones de cuadros seguidos para decir
+# "esta caja es la misma persona #7 del cuadro anterior".
 class Persona:
-    _next_id = 1
+    _next_id = 1                        # contador compartido: cada persona nueva recibe el siguiente ID
 
     def __init__(self, caja, t):
         self.id = Persona._next_id
         Persona._next_id += 1
-        self.caja = caja
+        self.caja = caja                # ultima caja donde se la vio
         self.t_inicio = self.t_visto = t
-        self.perdido = 0
-        self.rastro: deque = deque(maxlen=48)
+        self.perdido = 0                # cuantos cuadros seguidos lleva sin ser detectada
+        self.rastro: deque = deque(maxlen=48)   # ultimas 48 posiciones del centro (su "estela")
         self.rastro.append(self.centro)
         self.contada = False          # ya cruzo la linea una vez
         self.color = COLORES[self.id % len(COLORES)]
 
     @property
     def centro(self):
+        # Centro de la caja: se usa como "la posicion" de la persona
         x, y, w, h = self.caja
         return x + w / 2, y + h / 2
 
     def mover(self, caja, t):
+        # La persona fue vista otra vez: actualizamos su caja y reiniciamos "perdido"
         self.caja, self.perdido, self.t_visto = caja, 0, t
         self.rastro.append(self.centro)
 
@@ -191,33 +237,43 @@ class Rastreador:
     """Asocia detecciones con personas ya vistas por cercania del centroide."""
 
     def __init__(self, dist_max=110, max_perdido=25):
+        # dist_max: distancia maxima (px) que una persona puede moverse entre cuadros.
+        #           Si la deteccion esta mas lejos, se considera otra persona.
+        # max_perdido: cuadros sin verla antes de darla por ida (25 cuadros = ~1 s).
+        #              Esto evita perder a alguien que queda tapado un momento.
         self.dist_max, self.max_perdido = dist_max, max_perdido
         self.personas: list[Persona] = []
 
     def actualizar(self, cajas, t):
+        # Al empezar, suponemos que nadie fue visto en este cuadro
         for p in self.personas:
             p.perdido += 1
 
-        libres = list(self.personas)
+        libres = list(self.personas)    # personas que aun no tienen caja asignada en este cuadro
         for caja in cajas:
             cx, cy = caja[0] + caja[2] / 2, caja[1] + caja[3] / 2
+            # Buscamos la persona libre cuyo centro este mas cerca de esta caja
             mejor, mejor_d = None, self.dist_max
             for p in libres:
                 px, py = p.centro
-                d = float(np.hypot(cx - px, cy - py))
+                d = float(np.hypot(cx - px, cy - py))   # distancia en linea recta (Pitagoras)
                 if d < mejor_d:
                     mejor, mejor_d = p, d
             if mejor is None:
+                # Nadie estaba lo bastante cerca: es una persona nueva
                 self.personas.append(Persona(caja, t))
             else:
+                # Es la misma persona que ya conociamos: la movemos
                 mejor.mover(caja, t)
-                libres.remove(mejor)
+                libres.remove(mejor)    # ya no puede emparejarse con otra caja
 
+        # Quitamos a quienes llevan demasiado tiempo sin ser vistos
         salieron = [p for p in self.personas if p.perdido > self.max_perdido]
         self.personas = [p for p in self.personas if p.perdido <= self.max_perdido]
         return salieron
 
     def visibles(self):
+        # Solo las personas detectadas en ESTE cuadro
         return [p for p in self.personas if p.perdido == 0]
 
 
@@ -228,32 +284,42 @@ class LineaConteo:
     """Cuenta cruces con signo: de lado negativo a positivo = ENTRADA."""
 
     def __init__(self, p1, p2, invertir=False):
+        # p1 y p2: los dos extremos de la linea, en pixeles
         self.p1 = np.array(p1, dtype=np.float64)
         self.p2 = np.array(p2, dtype=np.float64)
-        self.invertir = invertir
+        self.invertir = invertir        # True = intercambia que sentido es entrada y cual salida
         self.entradas = 0
         self.salidas = 0
-        self.eventos: list[tuple[float, str, int]] = []
+        self.eventos: list[tuple[float, str, int]] = []   # (segundo, tipo, id de persona)
 
     def lado(self, punto):
         """Signo del producto cruz: de que lado de la linea cae el punto."""
+        # v = vector a lo largo de la linea; w = vector desde p1 hasta el punto.
+        # El producto cruz v x w es positivo de un lado de la linea y negativo del otro.
         v = self.p2 - self.p1
         w = np.array(punto, dtype=np.float64) - self.p1
         c = v[0] * w[1] - v[1] * w[0]
+        # Devuelve -1, 0 (justo encima de la linea) o +1
         return 0 if abs(c) < 1e-9 else (1 if c > 0 else -1)
 
     def revisar(self, persona, t, min_rastro=4):
         """Compara el lado actual contra el de hace unos cuadros."""
+        # Si ya la contamos, o aun no tiene suficiente historia, no hacemos nada
         if persona.contada or len(persona.rastro) < min_rastro:
             return None
+        # Lado de la linea hace 4 cuadros y lado ahora.
+        # Comparar contra hace varios cuadros (y no el anterior) evita
+        # contar el "temblor" de una caja que baila justo sobre la linea.
         antes = self.lado(persona.rastro[-min_rastro])
         ahora = self.lado(persona.rastro[-1])
         if antes == 0 or ahora == 0 or antes == ahora:
-            return None
+            return None                # no cambio de lado: no hubo cruce
         if not self._cerca(persona.rastro[-1]):
             return None            # cruzo la recta infinita, pero fuera del segmento
+        # Paso de negativo a positivo = entrada (a menos que se haya pedido invertir).
+        # "!= self.invertir" funciona como un XOR: si invertir es True, da vuelta el resultado.
         entra = (antes < 0 and ahora > 0) != self.invertir
-        persona.contada = True
+        persona.contada = True         # cada persona se cuenta UNA sola vez
         if entra:
             self.entradas += 1
         else:
@@ -265,48 +331,54 @@ class LineaConteo:
     def _cerca(self, punto, margen=1.35):
         """El cruce vale solo si ocurre sobre el segmento dibujado, no fuera."""
         v = self.p2 - self.p1
-        largo2 = float(v @ v)
+        largo2 = float(v @ v)              # largo de la linea al cuadrado (@ = producto punto)
         if largo2 < 1e-9:
-            return False
+            return False                   # linea de largo cero: no sirve
         w = np.array(punto, dtype=np.float64) - self.p1
         s = float(v @ w) / largo2          # proyeccion normalizada 0..1
+        # s = 0 en p1, s = 1 en p2. Damos un margen extra a cada lado (17.5 %)
         holgura = (margen - 1.0) / 2
         return -holgura <= s <= 1 + holgura
 
     @property
     def aforo(self):
+        # Cuantas personas hay "adentro" ahora mismo
         return self.entradas - self.salidas
 
 
 def pedir_linea(frame, ruta_cfg):
     """Dos clics definen la linea de conteo. Se guarda para la proxima vez."""
-    pts = []
+    pts = []                            # aqui se guardan los clics
 
     def on_mouse(event, x, y, flags, _):
+        # OpenCV llama a esta funcion cada vez que se usa el mouse en la ventana
         if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 2:
-            pts.append((x, y))
+            pts.append((x, y))          # clic izquierdo: agrega un punto
         elif event == cv2.EVENT_RBUTTONDOWN and pts:
-            pts.pop()
+            pts.pop()                   # clic derecho: borra el ultimo punto
 
     cv2.namedWindow("linea", cv2.WINDOW_NORMAL)
     cv2.setMouseCallback("linea", on_mouse)
     print("\n2 clics para la linea de conteo (puerta, pasillo, torniquete).")
     print("Clic derecho deshace. ENTER acepta. ESC cancela.\n")
     while True:
+        # Redibujamos en cada vuelta sobre una copia del primer cuadro
         vis = frame.copy()
         for p in pts:
-            cv2.circle(vis, p, 6, CYAN, -1)
+            cv2.circle(vis, p, 6, CYAN, -1)          # -1 = circulo relleno
         if len(pts) == 2:
             cv2.line(vis, pts[0], pts[1], CYAN, 3)
         cv2.putText(vis, "LINEA DE CONTEO: 2 clics + ENTER", (14, 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, CYAN, 2)
         cv2.imshow("linea", vis)
+        # waitKey espera 20 ms una tecla; & 0xFF se queda con el codigo de la tecla
         k = cv2.waitKey(20) & 0xFF
-        if k == 27:
+        if k == 27:                     # 27 = ESC
             cv2.destroyAllWindows()
             return None
-        if k in (13, 10) and len(pts) == 2:
+        if k in (13, 10) and len(pts) == 2:          # 13 o 10 = ENTER
             cv2.destroyAllWindows()
+            # Guardamos la linea para no tener que dibujarla la proxima vez
             with open(ruta_cfg, "w", encoding="utf-8") as f:
                 json.dump({"linea": [list(pts[0]), list(pts[1])]}, f, indent=2)
             print(f"Linea guardada en {ruta_cfg}")
@@ -316,55 +388,66 @@ def pedir_linea(frame, ruta_cfg):
 # --------------------------------------------------------------------------- #
 # 4. HUD
 # --------------------------------------------------------------------------- #
+# HUD = "Head-Up Display": los paneles de informacion dibujados sobre el video.
 def panel(img, x, y, w, h, titulo, filas, accent=CYAN):
+    # Dibuja un recuadro semitransparente con un titulo y varias filas de texto
     H, W = img.shape[:2]
+    # Recortamos el panel para que no se salga de la imagen
     x, y = max(x, 0), max(y, 0)
     w, h = min(w, W - x), min(h, H - y)
     if w <= 0 or h <= 0:
         return
-    sub = img[y:y + h, x:x + w]
+    sub = img[y:y + h, x:x + w]         # region de la imagen donde va el panel
+    # Mezcla 65 % de color oscuro con 35 % del video: efecto "vidrio oscuro"
     cv2.addWeighted(np.full(sub.shape, DARK, np.uint8), 0.65, sub, 0.35, 0, sub)
-    cv2.rectangle(img, (x, y), (x + w, y + h), accent, 1)
-    cv2.rectangle(img, (x, y), (x + w, y + 22), accent, -1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), accent, 1)        # borde
+    cv2.rectangle(img, (x, y), (x + w, y + 22), accent, -1)      # barra del titulo
     cv2.putText(img, titulo, (x + 8, y + 16), cv2.FONT_HERSHEY_SIMPLEX,
                 0.42, DARK, 1, cv2.LINE_AA)
     for i, fila in enumerate(filas):
-        yy = y + 44 + i * 26
+        yy = y + 44 + i * 26            # cada fila 26 px mas abajo
         if yy > y + h - 4:
-            break
+            break                       # no cabe mas texto en el panel
         cv2.putText(img, str(fila), (x + 8, yy), cv2.FONT_HERSHEY_SIMPLEX,
                     0.58, WHITE, 1, cv2.LINE_AA)
 
 
 def dibujar(frame, personas, linea, t_video, progress, serie, aforo_max):
+    # Devuelve una COPIA del cuadro con todo dibujado encima (no modifica el original)
     out = frame.copy()
     H, W = out.shape[:2]
 
     if linea is not None:
+        # La linea de conteo
         cv2.line(out, tuple(map(int, linea.p1)), tuple(map(int, linea.p2)),
                  CYAN, 3, cv2.LINE_AA)
         # flecha que indica cual sentido cuenta como ENTRADA
         medio = ((linea.p1 + linea.p2) / 2).astype(int)
         v = linea.p2 - linea.p1
+        # n = vector perpendicular a la linea (girar v 90 grados)
         n = np.array([-v[1], v[0]], dtype=np.float64)
+        # Lo normalizamos a largo 40 px, apuntando al lado de "entrada"
         n = n / (np.linalg.norm(n) + 1e-9) * (-40 if linea.invertir else 40)
         cv2.arrowedLine(out, tuple(medio), tuple((medio + n).astype(int)),
                         GREEN, 3, tipLength=0.35)
         cv2.putText(out, "IN", tuple((medio + n * 1.35).astype(int)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, GREEN, 2, cv2.LINE_AA)
 
+    # Cada persona: su caja, su centro, su estela y su numero
     for p in personas:
         x, y, w, h = p.caja
         cv2.rectangle(out, (x, y), (x + w, y + h), p.color, 2)
         cx, cy = map(int, p.centro)
         cv2.circle(out, (cx, cy), 4, p.color, -1)
         if len(p.rastro) > 1:
+            # polylines necesita los puntos con forma (N, 1, 2) y tipo int32
             pts = np.array(p.rastro, np.int32).reshape(-1, 1, 2)
             cv2.polylines(out, [pts], False, p.color, 2, cv2.LINE_AA)
-        etq = f"#{p.id}" + (" OK" if p.contada else "")
+        etq = f"#{p.id}" + (" OK" if p.contada else "")   # "OK" = ya fue contada
         cv2.putText(out, etq, (x, max(y - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, p.color, 2, cv2.LINE_AA)
 
+    # Panel principal con los contadores
     e = linea.entradas if linea else 0
     s = linea.salidas if linea else 0
     a = linea.aforo if linea else len(personas)
@@ -372,8 +455,9 @@ def dibujar(frame, personas, linea, t_video, progress, serie, aforo_max):
         f"Entradas : {e}",
         f"Salidas  : {s}",
         f"Aforo    : {a}",
-    ], accent=GREEN if a <= aforo_max else RED)
+    ], accent=GREEN if a <= aforo_max else RED)   # rojo si se supera el aforo
 
+    # Panel de la esquina derecha: personas visibles y tiempo del video
     panel(out, W - 210, 14, 196, 100, "SESION", [
         f"Visibles: {len(personas)}",
         f"T: {timedelta(seconds=int(t_video))}",
@@ -381,21 +465,25 @@ def dibujar(frame, personas, linea, t_video, progress, serie, aforo_max):
 
     # curva de ocupacion
     if len(serie) > 2:
-        x0, y0, wg, hg = 14, H - 84, 232, 56
+        x0, y0, wg, hg = 14, H - 84, 232, 56          # posicion y tamano del grafico
         cv2.rectangle(out, (x0, y0), (x0 + wg, y0 + hg), (90, 90, 90), 1)
+        # Tomamos los ultimos valores (uno por pixel de ancho del grafico)
         vals = np.array([v for _, v in serie][-wg:], dtype=np.float32)
-        top = max(float(vals.max()), 1.0)
+        top = max(float(vals.max()), 1.0)              # valor maximo = parte de arriba del grafico
+        # Convertimos cada valor a coordenadas de pixel (y crece hacia abajo en imagenes)
         xs = np.linspace(x0, x0 + wg, len(vals)).astype(np.int32)
         ys = (y0 + hg - vals / top * (hg - 4)).astype(np.int32)
         cv2.polylines(out, [np.stack([xs, ys], 1)], False, CYAN, 1, cv2.LINE_AA)
         cv2.putText(out, f"ocupacion (max {int(top)})", (x0 + 4, y0 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, GREY, 1, cv2.LINE_AA)
 
+    # Alerta visual: marco rojo si hay mas gente que el aforo permitido
     if aforo_max < 9999 and a > aforo_max:
         cv2.rectangle(out, (0, 0), (W - 1, H - 1), RED, 6)
         cv2.putText(out, "AFORO EXCEDIDO", (W // 2 - 130, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, RED, 3, cv2.LINE_AA)
 
+    # Barra de progreso en el borde inferior
     if progress is not None:
         cv2.rectangle(out, (0, H - 5), (int(W * progress), H - 1), CYAN, -1)
     return out
@@ -405,6 +493,7 @@ def dibujar(frame, personas, linea, t_video, progress, serie, aforo_max):
 # 5. Programa principal
 # --------------------------------------------------------------------------- #
 def main() -> None:
+    # ---- Opciones de la linea de comandos (ver: python contador.py --help) ---- #
     ap = argparse.ArgumentParser(description="Conteo de personas en video")
     ap.add_argument("video", help="archivo de video, indice de webcam (0) o URL RTSP")
     ap.add_argument("--motor", default="auto", choices=["auto", "yolo", "dnn", "hog"])
@@ -425,6 +514,8 @@ def main() -> None:
     ap.add_argument("--speed", type=float, default=0.0, help="0 = a tope, 1 = tiempo real")
     args = ap.parse_args()
 
+    # ---- Abrir el video ---- #
+    # Si el argumento es un numero ("0"), es una webcam; si no, un archivo o URL
     src = int(args.video) if args.video.isdigit() else args.video
     if isinstance(src, str) and not os.path.exists(src) and "://" not in src:
         sys.exit(f"No existe el archivo: {src}")
@@ -432,11 +523,14 @@ def main() -> None:
     if not cap.isOpened():
         sys.exit(f"OpenCV no pudo abrir: {args.video}")
 
-    fps_in = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    # Datos del video: cuadros por segundo, cantidad de cuadros y duracion
+    fps_in = cap.get(cv2.CAP_PROP_FPS) or 25.0      # si no lo sabe (webcam), asume 25
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     dur = n_frames / fps_in if n_frames else 0.0
     if args.start > 0:
+        # Saltar al segundo pedido con --start (OpenCV trabaja en milisegundos)
         cap.set(cv2.CAP_PROP_POS_MSEC, args.start * 1000.0)
+    # Leemos el primer cuadro para conocer el tamano de la imagen
     ok, frame = cap.read()
     if not ok:
         sys.exit("No pude leer el primer cuadro.")
@@ -447,28 +541,35 @@ def main() -> None:
     # ---- linea de conteo: mouse, archivo guardado, o media pantalla ---- #
     pts = None
     if args.linea and not args.headless:
-        pts = pedir_linea(frame, args.config)
+        pts = pedir_linea(frame, args.config)          # 1) el usuario la dibuja
     if pts is None and os.path.exists(args.config):
-        with open(args.config, encoding="utf-8") as f:
+        with open(args.config, encoding="utf-8") as f:  # 2) se lee de linea.json
             pts = [tuple(p) for p in json.load(f)["linea"]]
         print(f"[config] linea desde {args.config}")
     if pts is None:
-        pts = [(0, H // 2), (W, H // 2)]
+        pts = [(0, H // 2), (W, H // 2)]                # 3) horizontal a media altura
         print("[aviso] sin linea definida: uso una horizontal a media pantalla.\n"
               "        Corre con --linea para dibujar la tuya.")
     linea = LineaConteo(pts[0], pts[1], invertir=args.invertir)
 
+    # Creamos las tres piezas del sistema: detector, rastreador (y la linea, arriba)
     det = Detector(args.motor, args.modelo, args.proto, args.conf)
     rastreador = Rastreador()
 
+    # ---- Grabacion opcional del video con las detecciones (--record) ---- #
     writer = None
     if args.record:
+        # "mp4v" = codec MPEG-4. Si procesamos 1 de cada N cuadros, bajamos los FPS
         writer = cv2.VideoWriter(args.record, cv2.VideoWriter_fourcc(*"mp4v"),
                                  fps_in / max(args.stride, 1), (W, H))
         if not writer.isOpened():
             print("[aviso] no pude abrir el VideoWriter; sigo sin grabar.")
             writer = None
 
+    # ---- CSV de eventos: una fila por cada ENTRADA o SALIDA ---- #
+    # OJO: se abre en modo "a" (append = agregar al final). Cada ejecucion
+    # AGREGA filas al archivo existente; no lo borra. Solo se escribe el
+    # encabezado si el archivo es nuevo.
     nuevo = not os.path.exists(args.csv)
     csv_f = open(args.csv, "a", newline="", encoding="utf-8")
     csv_w = csv.writer(csv_f)
@@ -476,6 +577,7 @@ def main() -> None:
         csv_w.writerow(["t_video_s", "timestamp", "evento", "persona_id",
                         "entradas", "salidas", "aforo"])
 
+    # ---- CSV opcional de ocupacion: una fila por segundo (--serie-csv) ---- #
     serie_f = serie_w = None
     if args.serie_csv:
         nuevo_s = not os.path.exists(args.serie_csv)
@@ -484,99 +586,119 @@ def main() -> None:
         if nuevo_s:
             serie_w.writerow(["t_video_s", "timestamp", "visibles", "aforo"])
 
-    serie: deque = deque(maxlen=2000)
-    vis = frame.copy()
-    idx = processed = 0
-    ultimo_log = -1e9
+    # ---- Variables del bucle principal ---- #
+    serie: deque = deque(maxlen=2000)    # historial (tiempo, personas visibles) para el grafico
+    vis = frame.copy()                   # la imagen que se muestra en pantalla
+    idx = processed = 0                  # cuadros leidos y cuadros realmente procesados
+    ultimo_log = -1e9                    # ultimo segundo escrito en el CSV de ocupacion
     paused = False
-    t0_wall = time.time()
-    t_video = args.start
+    t0_wall = time.time()                # hora real de inicio (para --speed)
+    t_video = args.start                 # segundo actual dentro del video
 
     print("Procesando...  (q = salir)")
     try:
+        # ================= BUCLE PRINCIPAL: una vuelta por cuadro ================= #
         while True:
             if not paused:
+                # El primer cuadro ya se leyo arriba; desde el segundo leemos aqui
                 if idx > 0:
                     ok, frame = cap.read()
                     if not ok:
                         print("\nFin del video.")
                         break
                 idx += 1
+                # Tiempo actual del video en segundos
                 pos = cap.get(cv2.CAP_PROP_POS_MSEC)
                 t_video = pos / 1000.0 if pos and pos > 0 else args.start + idx / fps_in
                 if args.end is not None and t_video > args.end:
                     print("\nLlegue al segundo final pedido.")
                     break
+                # --stride N: saltamos cuadros para ir mas rapido
                 if args.stride > 1 and (idx - 1) % args.stride:
                     continue
                 processed += 1
 
+                # PASO 1: detectar personas en este cuadro
                 cajas = det.detectar(frame)
+                # PASO 2: emparejarlas con las personas que ya conociamos
                 rastreador.actualizar(cajas, t_video)
 
+                # PASO 3: revisar si alguien cruzo la linea
                 for p in rastreador.visibles():
                     tipo = linea.revisar(p, t_video)
                     if tipo:
+                        # PASO 4: registrar el cruce en el CSV
                         csv_w.writerow([round(t_video, 2),
                                         datetime.now().isoformat(timespec="seconds"),
                                         tipo, p.id, linea.entradas, linea.salidas,
                                         linea.aforo])
-                        csv_f.flush()
+                        csv_f.flush()   # escribir al disco ya, por si el programa se corta
                         print(f"\n  [{timedelta(seconds=int(t_video))}] {tipo}"
                               f"  persona #{p.id}  ->  aforo={linea.aforo}")
 
+                # Guardamos cuantas personas se ven (para el grafico y el CSV de ocupacion)
                 visibles = rastreador.visibles()
                 serie.append((t_video, len(visibles)))
-                if serie_w and t_video - ultimo_log >= 1.0:
+                if serie_w and t_video - ultimo_log >= 1.0:    # como maximo una fila por segundo
                     ultimo_log = t_video
                     serie_w.writerow([round(t_video, 2),
                                       datetime.now().isoformat(timespec="seconds"),
                                       len(visibles), linea.aforo])
                     serie_f.flush()
 
-                progress = (t_video / dur) if dur else None
+                # PASO 5: dibujar todo sobre el cuadro
+                progress = (t_video / dur) if dur else None    # fraccion del video recorrida (0 a 1)
                 vis = dibujar(frame, visibles, linea, t_video, progress,
                               serie, args.aforo_max)
                 if writer:
-                    writer.write(vis)
+                    writer.write(vis)                           # agregar el cuadro al video de salida
 
+                # Sin ventana: mostramos el avance en la terminal cada 25 cuadros
                 if args.headless and processed % 25 == 0:
                     pct = f"{progress*100:5.1f}%" if progress else f"{processed} cuadros"
+                    # \r vuelve al inicio de la linea: el texto se sobrescribe en el mismo renglon
                     sys.stdout.write(f"\r  {pct}  t={timedelta(seconds=int(t_video))}  "
                                      f"visibles={len(visibles)}  "
                                      f"in={linea.entradas} out={linea.salidas} "
                                      f"aforo={linea.aforo}   ")
                     sys.stdout.flush()
 
+                # --speed: si vamos mas rapido que el video real, esperamos un poco
                 if args.speed > 0:
-                    objetivo = (t_video - args.start) / args.speed
-                    lag = objetivo - (time.time() - t0_wall)
+                    objetivo = (t_video - args.start) / args.speed   # cuanto tiempo real deberia haber pasado
+                    lag = objetivo - (time.time() - t0_wall)         # cuanto vamos adelantados
                     if lag > 0:
                         time.sleep(min(lag, 0.25))
 
+            # ---- Mostrar en ventana y leer el teclado ---- #
             if not args.headless:
                 try:
                     cv2.imshow("Conteo de personas", vis)
                 except cv2.error:
+                    # Algunas instalaciones (servidores, Colab) no pueden abrir ventanas
                     print("[aviso] este OpenCV no tiene ventanas; sigo headless.")
                     args.headless = True
                     continue
+                # waitKey(1): espera 1 ms por una tecla. Sin esta llamada la ventana no se actualiza.
                 k = cv2.waitKey(1) & 0xFF
-                if k == ord("q"):
+                if k == ord("q"):               # q = salir
                     break
-                if k == ord(" "):
+                if k == ord(" "):               # espacio = pausa / continuar
                     paused = not paused
-                if k == ord("s"):
+                if k == ord("s"):               # s = guardar captura PNG
                     nombre = f"captura_{int(t_video)}s.png"
                     cv2.imwrite(nombre, vis)
                     print("Guardado", nombre)
-                if k == ord("r"):
+                if k == ord("r"):               # r = reiniciar contadores
                     linea.entradas = linea.salidas = 0
                     linea.eventos.clear()
                     print("Contadores reiniciados.")
     except KeyboardInterrupt:
+        # Ctrl+C en la terminal: salimos ordenadamente
         print("\nInterrumpido.")
     finally:
+        # "finally" se ejecuta SIEMPRE, aunque haya error: cerramos todo
+        # para que el video y los CSV queden bien guardados.
         cap.release()
         if writer:
             writer.release()
@@ -610,5 +732,7 @@ def main() -> None:
     print("=" * 62)
 
 
+# Esto hace que main() se ejecute solo cuando corres el archivo directamente
+# (python contador.py), y no cuando otro programa lo importa.
 if __name__ == "__main__":
     main()
